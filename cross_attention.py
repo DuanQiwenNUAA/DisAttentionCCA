@@ -6,8 +6,9 @@ class CrossAttention(nn.Module):
     """
     交叉注意力机制模块，用于处理两个不同视图的数据
     计算视图间的注意力权重并生成新的特征表示
+    新增分类层用于标签预测
     """
-    def __init__(self, input_dim1, input_dim2, hidden_dim=None, output_dim=None):
+    def __init__(self, input_dim1, input_dim2, hidden_dim=None, output_dim=None, num_classes=None):
         """
         初始化交叉注意力模块
         
@@ -16,6 +17,7 @@ class CrossAttention(nn.Module):
             input_dim2: 第二个视图的输入维度
             hidden_dim: 隐藏层维度，默认与input_dim1相同
             output_dim: 输出特征的维度，默认与input_dim1相同
+            num_classes: 分类类别数，如果为None则不添加分类层
         """
         super(CrossAttention, self).__init__()
         
@@ -23,6 +25,7 @@ class CrossAttention(nn.Module):
         self.input_dim2 = input_dim2
         self.hidden_dim = hidden_dim if hidden_dim is not None else input_dim1
         self.output_dim = output_dim if output_dim is not None else input_dim1
+        self.num_classes = num_classes
         
         # 定义查询、键、值的线性变换层
         self.query = nn.Linear(input_dim1, self.hidden_dim)
@@ -32,19 +35,33 @@ class CrossAttention(nn.Module):
         # 输出层，将注意力加权后的特征映射到指定维度空间
         self.output_layer = nn.Linear(self.hidden_dim, self.output_dim)
         
+        # 分类层
+        if num_classes is not None:
+            self.classifier = nn.Sequential(
+                nn.Linear(output_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, num_classes)
+            )
+        
         # 缩放因子，用于稳定注意力分数
         self.scale = torch.sqrt(torch.FloatTensor([self.hidden_dim]))
     
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, labels=None):
         """
         前向传播函数
         
         参数:
             x1: 第一个视图的特征，形状为 [batch_size, seq_len1, input_dim1]
             x2: 第二个视图的特征，形状为 [batch_size, seq_len2, input_dim2]
+            labels: 可选的真实标签，形状为 [batch_size]
         
         返回:
-            output: 交叉注意力处理后的特征，形状为 [batch_size, seq_len1, output_dim]
+            如果num_classes为None:
+                output: 交叉注意力处理后的特征，形状为 [batch_size, seq_len1, output_dim]
+            否则:
+                output: 交叉注意力处理后的特征
+                predictions: 预测标签，形状为 [batch_size, num_classes]
+                loss: 交叉熵损失（如果提供了labels）
         """
         # 计算查询、键、值
         query = self.query(x1)
@@ -63,10 +80,21 @@ class CrossAttention(nn.Module):
         # 通过输出层映射到指定维度空间
         output = self.output_layer(attended_values)
         
-        return output
+        if self.num_classes is None:
+            return output
+        else:
+            # 拼接两个视图的输出特征
+            combined = torch.cat([torch.mean(output, dim=1), torch.mean(attended_values, dim=1)], dim=1)
+            predictions = self.classifier(combined)
+            
+            if labels is not None:
+                loss = F.cross_entropy(predictions, labels)
+                return output, predictions, loss
+            else:
+                return output, predictions, None
 
 
-def apply_cross_attention(view1_data, view2_data, model, device=None, train_mode=False):
+def apply_cross_attention(view1_data, view2_data, model, device=None, train_mode=False, labels=None):
     """
     应用交叉注意力模型处理两个视图数据的函数
     
@@ -76,9 +104,15 @@ def apply_cross_attention(view1_data, view2_data, model, device=None, train_mode
         model: 交叉注意力模型实例
         device: 计算设备，默认为None
         train_mode: 是否为训练模式
+        labels: 可选的真实标签，形状为 [batch_size]
     
     返回:
-        processed_data: 处理后的视图数据
+        如果模型没有分类层:
+            processed_data: 处理后的视图数据
+        否则:
+            processed_data: 处理后的视图数据
+            predictions: 预测标签
+            loss: 交叉熵损失（如果提供了labels）
     """
     # 如果数据不是torch张量，转换为张量
     if not isinstance(view1_data, torch.Tensor):
@@ -96,11 +130,23 @@ def apply_cross_attention(view1_data, view2_data, model, device=None, train_mode
     if train_mode:
         model.train()
         # 训练模式下启用梯度计算
-        processed_data = model(view1_data, view2_data)
+        if labels is not None:
+            if not isinstance(labels, torch.Tensor):
+                labels = torch.tensor(labels, dtype=torch.long)
+            if device is not None:
+                labels = labels.to(device)
+            return model(view1_data, view2_data, labels)
+        else:
+            return model(view1_data, view2_data)
     else:
         # 评估模式
         model.eval()
         with torch.no_grad():
-            processed_data = model(view1_data, view2_data)
-    
-    return processed_data
+            if labels is not None:
+                if not isinstance(labels, torch.Tensor):
+                    labels = torch.tensor(labels, dtype=torch.long)
+                if device is not None:
+                    labels = labels.to(device)
+                return model(view1_data, view2_data, labels)
+            else:
+                return model(view1_data, view2_data)

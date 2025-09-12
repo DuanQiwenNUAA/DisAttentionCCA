@@ -87,13 +87,15 @@ class AttentionCCA:
             input_dim1=self.config['view1_output_dim'] or self.config['view1_input_dim'],
             input_dim2=self.config['view2_output_dim'] or self.config['view2_input_dim'],
             hidden_dim=self.config['hidden_dim'],
-            output_dim=self.config['view1_output_dim'] or self.config['view1_input_dim']
+            output_dim=self.config['view1_output_dim'] or self.config['view1_input_dim'],
+            num_classes=self.config.get('num_classes')
         )
         self.cross_attention2 = CrossAttention(
             input_dim1=self.config['view2_output_dim'] or self.config['view2_input_dim'],
             input_dim2=self.config['view1_output_dim'] or self.config['view1_input_dim'],
             hidden_dim=self.config['hidden_dim'],
-            output_dim=self.config['view2_output_dim'] or self.config['view2_input_dim']
+            output_dim=self.config['view2_output_dim'] or self.config['view2_input_dim'],
+            num_classes=self.config.get('num_classes')
         )
             
     def process_views(self, view1_data, view2_data, sequence_length1=None, sequence_length2=None):
@@ -295,12 +297,13 @@ class AttentionCCA:
 # 示例用法函数
 def demo_attention_cca():
     """
-    演示AttentionCCA的使用方法，包括模型训练过程
+    演示AttentionCCA的使用方法，包括模型训练过程和标签分类
     """
-    # 创建模拟数据
+    # 创建模拟数据和标签
     np.random.seed(42)
     view1_data = np.random.rand(100, 100)  # 100个样本，每个样本100维
     view2_data = np.random.rand(100, 100)  # 100个样本，每个样本100维
+    labels = np.random.randint(0, 3, size=100)  # 生成3类标签
     
     # 创建配置
     config = {
@@ -386,6 +389,19 @@ def demo_attention_cca():
         learning_rate=0.001,  # 学习率
         train_phase='self_attention'
     )
+    
+    # 评估分类性能
+    print("===== 评估分类性能 =====")
+    from sklearn.metrics import classification_report
+    from sklearn.svm import SVC
+    
+    # 使用处理后的特征训练分类器
+    clf = SVC()
+    # Reshape processed_view1 to 2D by averaging over sequence dimension
+    processed_view1_2d = torch.mean(processed_view1, dim=1).detach().numpy()
+    clf.fit(processed_view1_2d, labels[:80])
+    pred = clf.predict(processed_view1_2d)
+    print(classification_report(labels[:80], pred))
     
     # 保存训练后的自注意力模型
     model.save_models('view1_attention_model.pth', 'view2_attention_model.pth')
