@@ -1,0 +1,55 @@
+# 忽略Python编译文件
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# 忽略模型权重文件
+*.pth
+
+# 忽略测试文件
+*.test
+*.tests
+
+# 忽略日志文件
+*.log
+*.log.*
+logs/
+
+# 忽略数据文件
+data/
+*.data
+*.csv
+*.json
+*.npy
+*.npz
+
+# 忽略IDE配置文件
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 忽略操作系统文件
+.DS_Store
+Thumbs.db
+
+# 忽略环境和依赖
+venv/
+env/
+*.egg-info/
+build/
+dist/
+
+# 忽略其他临时文件
+*.tmp
+*.temp
+.cache/
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
