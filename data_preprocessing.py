@@ -104,18 +104,19 @@ def convert_to_tensor(data, dtype=torch.float32):
         return torch.tensor(data, dtype=dtype)
 
 
-def split_train_test(view1, view2, test_ratio=0.2, random_state=None):
+def split_train_test(view1, view2, labels, test_ratio=0.2, random_state=None):
     """
-    分割训练集和测试集
+    分割训练集和测试集，同时对标签进行分割
     
     参数:
         view1: 第一个视图的数据
         view2: 第二个视图的数据
+        labels: 标签数据
         test_ratio: 测试集比例
         random_state: 随机种子
     
     返回:
-        tuple: (view1_train, view1_test, view2_train, view2_test)
+        tuple: (view1_train, view1_test, view2_train, view2_test, labels_train, labels_test)
     """
     # 设置随机种子
     if random_state is not None:
@@ -135,17 +136,19 @@ def split_train_test(view1, view2, test_ratio=0.2, random_state=None):
     
     view1_train, view1_test = view1[train_indices], view1[test_indices]
     view2_train, view2_test = view2[train_indices], view2[test_indices]
-    
-    return view1_train, view1_test, view2_train, view2_test
+    labels_train, labels_test = labels[train_indices], labels[test_indices]
+
+    return view1_train, view1_test, view2_train, view2_test, labels_train, labels_test
 
 
-def batch_data(view1, view2, batch_size, shuffle=True):
+def batch_data(view1, view2, labels, batch_size, shuffle=True):
     """
     将数据分批次，方便模型训练
     
     参数:
         view1: 第一个视图的数据
         view2: 第二个视图的数据
+        labels: 标签数据
         batch_size: 批次大小
         shuffle: 是否打乱数据
     
@@ -167,4 +170,7 @@ def batch_data(view1, view2, batch_size, shuffle=True):
         end_idx = min(start_idx + batch_size, n_samples)
         batch_indices = indices[start_idx:end_idx]
         
-        yield view1[batch_indices], view2[batch_indices]
+        if labels is not None:
+            yield view1[batch_indices], view2[batch_indices], labels[batch_indices]
+        else:
+            yield view1[batch_indices], view2[batch_indices], None
