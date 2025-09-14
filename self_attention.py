@@ -32,6 +32,7 @@ class SelfAttention(nn.Module):
         
         # 缩放因子，用于稳定注意力分数
         self.scale = torch.sqrt(torch.FloatTensor([self.hidden_dim]))
+        
     
     def forward(self, x):
         """
@@ -43,7 +44,7 @@ class SelfAttention(nn.Module):
         返回:
             output: 自注意力处理后的特征，形状为 [batch_size, seq_len, output_dim]
         """
-        
+            
         # 计算查询、键、值
         query = self.query(x)
         key = self.key(x)
@@ -114,7 +115,6 @@ class MultiHeadSelfAttention(nn.Module):
             output: 多头自注意力处理后的特征，形状为 [batch_size, seq_len, output_dim]
         """
         batch_size = x.shape[0]
-        
         # 计算查询、键、值
         query = self.query(x)
         key = self.key(x)

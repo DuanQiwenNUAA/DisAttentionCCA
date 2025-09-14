@@ -15,6 +15,7 @@ from data_preprocessing import (
 )
 from evaluation import evaluate_attention_effect, evaluate_kmeans_clustering
 from complexity_metrics import compute_pds, compute_mnc, calculate_dataset_complexity
+import scipy.io as sio
 
 
 class AttentionCCA:
@@ -41,7 +42,7 @@ class AttentionCCA:
             'hidden_dim': 128,  # 隐藏层维度
             'use_gpu': False,  # 是否使用GPU
             'enable_cross_attention': True,  # 是否执行交叉注意力环节
-            'num_classes': 10  # 分类类别数，默认为10
+            'num_classes': 40  # 分类类别数，设置为40以匹配1-40的标签范围
         }
         
         # 更新配置
@@ -102,7 +103,7 @@ class AttentionCCA:
         # 初始化分类器
         combined_dim = (self.config['view1_output_dim'] or self.config['view1_input_dim']) + \
                       (self.config['view2_output_dim'] or self.config['view2_input_dim'])
-        self.classifier = nn.Linear(combined_dim, self.config.get('num_classes', 10))
+        self.classifier = nn.Linear(combined_dim, self.config.get('num_classes', 40))
             
     def process_views(self, view1_data, view2_data, sequence_length1=None, sequence_length2=None):
         """
@@ -211,8 +212,78 @@ class AttentionCCA:
         loss = 1 - correlation
         
         return loss
+
+    def cca_loss(self, H1, H2):
+        """
+
+        It is the loss function of CCA as introduced in the original paper. There can be other formulations.
+
+        """
+
+        r1 = 1e-3
+        r2 = 1e-3
+        eps = 1e-9
+
+        H1, H2 = H1.squeeze().t(), H2.squeeze().t()
+
+        o1 = o2 = H1.size(0)
+
+        m = H1.size(1)
+
+        H1bar = H1 - H1.mean(dim=1).unsqueeze(dim=1)
+        H2bar = H2 - H2.mean(dim=1).unsqueeze(dim=1)
+
+        SigmaHat12 = (1.0 / (m - 1)) * torch.matmul(H1bar, H2bar.t())
+        SigmaHat11 = (1.0 / (m - 1)) * torch.matmul(H1bar,
+                                                    H1bar.t()) + r1 * torch.eye(o1, device=self.device)
+        SigmaHat11 = SigmaHat11 + 1e-8 * torch.randn_like(SigmaHat11)
+        SigmaHat22 = (1.0 / (m - 1)) * torch.matmul(H2bar,
+                                                    H2bar.t()) + r2 * torch.eye(o2, device=self.device)
+        SigmaHat22 = SigmaHat22 + 1e-8 * torch.randn_like(SigmaHat22)
+
+        # Calculating the root inverse of covariance matrices by using eigen decomposition
+        UPLO = "U"
+
+        # [D1, V1] = torch.linalg.eigh(SigmaHat11, UPLO=UPLO)
+        [D2, V2] = torch.linalg.eigh(SigmaHat22, UPLO=UPLO)
+        [D1, V1] = torch.linalg.eigh(SigmaHat11, UPLO=UPLO)
         
-    def train_model(self, train_data, labels=None, num_epochs=100, batch_size=32, learning_rate=0.001, train_phase='self_attention'):
+        # Added to increase stability
+        posInd1 = torch.gt(D1, eps).nonzero()[:, 0]
+        D1 = D1[posInd1]
+        V1 = V1[:, posInd1]
+        posInd2 = torch.gt(D2, eps).nonzero()[:, 0]
+        D2 = D2[posInd2]
+        V2 = V2[:, posInd2]
+        
+        # Ensure eigenvalues are positive and not too small
+        D1 = torch.clamp(D1, min=eps)
+        D2 = torch.clamp(D2, min=eps)     
+
+        SigmaHat11RootInv = torch.matmul(
+            torch.matmul(V1, torch.diag(D1 ** -0.5)), V1.t())
+        SigmaHat22RootInv = torch.matmul(
+            torch.matmul(V2, torch.diag(D2 ** -0.5)), V2.t())
+
+        Tval = torch.matmul(torch.matmul(SigmaHat11RootInv,
+                                         SigmaHat12), SigmaHat22RootInv)
+
+        # if self.use_all_singular_values:
+            # all singular values are used to calculate the correlation
+        tmp = torch.matmul(Tval.t(), Tval)
+        corr = torch.trace(torch.sqrt(tmp))
+            # assert torch.isnan(corr).item() == 0
+        # else:
+        #     # just the top self.outdim_size singular values are used
+        #     trace_TT = torch.matmul(Tval.t(), Tval)
+        #     trace_TT = torch.add(trace_TT, (torch.eye(trace_TT.shape[0])*r1).to(self.device)) # regularization for more stability
+        #     U, V = torch.linalg.eigh(trace_TT, UPLO=UPLO)
+        #     U = torch.where(U>eps, U, (torch.ones(U.shape).double()*eps).to(self.device))
+        #     U = U.topk(self.outdim_size)[0]
+        #     corr = torch.sum(torch.sqrt(U))
+        return -corr
+        
+    def train_model(self, train_data, labels=None, num_epochs=100, batch_size=32, learning_rate=0.01, train_phase='self_attention'):
         """
         训练AttentionCCA模型
         
@@ -301,14 +372,14 @@ class AttentionCCA:
                     # 确保分类器也在相同设备上
                     self.classifier = self.classifier.to(self.device)
                     # 计算分类损失
-                    classification_loss = F.cross_entropy(self.classifier(combined_features), batch_labels)
+                    classification_loss = F.cross_entropy(self.classifier(combined_features), batch_labels - 1)  # 将1-40标签转换为0-39范围
                     # 组合相关性损失和分类损失，使用加权和
                     loss = 0.5 * self._correlation_loss(processed_view1, processed_view2) + 0.5 * classification_loss
                 else:
                     loss = self._correlation_loss(processed_view1, processed_view2)
                 
                 # 反向传播和参数更新
-                optimizer.zero_grad()
+                # optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 
@@ -336,80 +407,81 @@ def demo_attention_cca():
     """
     演示AttentionCCA的使用方法，包括模型训练过程和标签分类
     """
-    # 创建模拟数据和标签
-    np.random.seed(42)
-    view1_data = np.random.rand(100, 100)  # 100个样本，每个样本100维
-    view2_data = np.random.rand(100, 100)  # 100个样本，每个样本100维
-    labels = np.random.randint(0, 3, size=100)  # 生成3类标签
+    # 四个视图，分别为：（400，512）、（400，59）、（400，864）、（400，254）
+    mat_data = sio.loadmat("D:\本科毕业设计\Python_Projects\DataSets\数据集\ORL.mat")
+    view1_data = mat_data['fea'][0][0]
+    view2_data = mat_data['fea'][0][1]
+
+    labels = mat_data['gt'].squeeze()
     
     # 创建配置
     config = {
-        'view1_input_dim': 100,
-        'view2_input_dim': 100,
+        'view1_input_dim': view1_data.shape[1],
+        'view2_input_dim': view2_data.shape[1],
         'view1_output_dim': 50,  # 指定降维后的输出维度
         'view2_output_dim': 50,  # 指定降维后的输出维度
         'attention_type': 'multihead',
         'num_heads': 4,
         'hidden_dim': 128,
         'use_gpu': True,
-        'num_classes': 3,  # 假设我们有3个类别
+        'num_classes': 40,  # 40个类别
     }
     
     # 初始化模型
     model = AttentionCCA(config)
     
-    # 使用未训练的模型处理数据
-    print("===== 未训练模型的处理结果 =====")
-    untrained_view1, untrained_view2 = model.process_views(view1_data, view2_data)
-    print(f"\n测试数据形状:")
-    print(f"  视图1形状: {view1_data.shape}")
-    print(f"  视图2形状: {view2_data.shape}")
-    print(f"训练后处理结果形状:")
-    print(f"  视图1形状: {untrained_view1.shape}")
-    print(f"  视图2形状: {untrained_view2.shape}")
+    # # 使用未训练的模型处理数据
+    # print("===== 未训练模型的处理结果 =====")
+    # untrained_view1, untrained_view2 = model.process_views(view1_data, view2_data)
+    # print(f"\n测试数据形状:")
+    # print(f"  视图1形状: {view1_data.shape}")
+    # print(f"  视图2形状: {view2_data.shape}")
+    # print(f"训练后处理结果形状:")
+    # print(f"  视图1形状: {untrained_view1.shape}")
+    # print(f"  视图2形状: {untrained_view2.shape}")
 
-    # 评估处理前后视图之间的相关性
-    print("\n评估处理前后视图之间的相关性:")
-    print("=========================")
+    # # 评估处理前后视图之间的相关性
+    # print("\n评估处理前后视图之间的相关性:")
+    # print("=========================")
     
-    # 先确保数据是numpy数组
-    if isinstance(view1_data, torch.Tensor):
-        view1_data = view1_data.cpu().numpy()
-    if isinstance(view2_data, torch.Tensor):
-        view2_data = view2_data.cpu().numpy()
-    if isinstance(untrained_view1, torch.Tensor):
-        untrained_view1 = untrained_view1.cpu().numpy()
-    if isinstance(untrained_view2, torch.Tensor):
-        untrained_view2 = untrained_view2.cpu().numpy()
+    # # 先确保数据是numpy数组
+    # if isinstance(view1_data, torch.Tensor):
+    #     view1_data = view1_data.cpu().numpy()
+    # if isinstance(view2_data, torch.Tensor):
+    #     view2_data = view2_data.cpu().numpy()
+    # if isinstance(untrained_view1, torch.Tensor):
+    #     untrained_view1 = untrained_view1.cpu().numpy()
+    # if isinstance(untrained_view2, torch.Tensor):
+    #     untrained_view2 = untrained_view2.cpu().numpy()
     
     # 评估原始视图间相关性
-    original_cross_correlation_result = evaluate_attention_effect(view1_data, view2_data)
-    original_cross_correlation = original_cross_correlation_result['cross_correlation']
+    # original_cross_correlation_result = evaluate_attention_effect(view1_data, view2_data)
+    # original_cross_correlation = original_cross_correlation_result['cross_correlation']
 
     # 评估处理后视图间相关性
-    processed_cross_correlation_result = evaluate_attention_effect(untrained_view1, untrained_view2)
-    processed_cross_correlation = processed_cross_correlation_result['cross_correlation']
+    # processed_cross_correlation_result = evaluate_attention_effect(untrained_view1, untrained_view2)
+    # processed_cross_correlation = processed_cross_correlation_result['cross_correlation']
 
-    print("\n原始视图间相关性:")
-    print(f"  视图1形状: {original_cross_correlation_result['view1_shape']}")
-    print(f"  视图2形状: {original_cross_correlation_result['view2_shape']}")
-    print(f"  视图1均值: {original_cross_correlation_result['view1_mean']:.4f}")
-    print(f"  视图2均值: {original_cross_correlation_result['view2_mean']:.4f}")
-    print(f"  视图1方差: {original_cross_correlation_result['view1_variance']:.4f}")
-    print(f"  视图2方差: {original_cross_correlation_result['view2_variance']:.4f}")
-    print(f"  视图间相关性: {original_cross_correlation:.4f}")
+    # print("\n原始视图间相关性:")
+    # print(f"  视图1形状: {original_cross_correlation_result['view1_shape']}")
+    # print(f"  视图2形状: {original_cross_correlation_result['view2_shape']}")
+    # print(f"  视图1均值: {original_cross_correlation_result['view1_mean']:.4f}")
+    # print(f"  视图2均值: {original_cross_correlation_result['view2_mean']:.4f}")
+    # print(f"  视图1方差: {original_cross_correlation_result['view1_variance']:.4f}")
+    # print(f"  视图2方差: {original_cross_correlation_result['view2_variance']:.4f}")
+    # print(f"  视图间相关性: {original_cross_correlation:.4f}")
     
-    print("\n处理后视图间相关性:")
-    print(f"  视图1形状: {processed_cross_correlation_result['view1_shape']}")
-    print(f"  视图2形状: {processed_cross_correlation_result['view2_shape']}")
-    print(f"  视图1均值: {processed_cross_correlation_result['view1_mean']:.4f}")
-    print(f"  视图2均值: {processed_cross_correlation_result['view2_mean']:.4f}")
-    print(f"  视图1方差: {processed_cross_correlation_result['view1_variance']:.4f}")
-    print(f"  视图2方差: {processed_cross_correlation_result['view2_variance']:.4f}")
-    print(f"  视图间相关性: {processed_cross_correlation:.4f}")
+    # print("\n处理后视图间相关性:")
+    # print(f"  视图1形状: {processed_cross_correlation_result['view1_shape']}")
+    # print(f"  视图2形状: {processed_cross_correlation_result['view2_shape']}")
+    # print(f"  视图1均值: {processed_cross_correlation_result['view1_mean']:.4f}")
+    # print(f"  视图2均值: {processed_cross_correlation_result['view2_mean']:.4f}")
+    # print(f"  视图1方差: {processed_cross_correlation_result['view1_variance']:.4f}")
+    # print(f"  视图2方差: {processed_cross_correlation_result['view2_variance']:.4f}")
+    # print(f"  视图间相关性: {processed_cross_correlation:.4f}")
     
-    print("\n相关性比较:")
-    print(f"  相关性变化: {processed_cross_correlation - original_cross_correlation:.4f} ({(processed_cross_correlation - original_cross_correlation) / original_cross_correlation * 100:.2f}%)")
+    # print("\n相关性比较:")
+    # print(f"  相关性变化: {processed_cross_correlation - original_cross_correlation:.4f} ({(processed_cross_correlation - original_cross_correlation) / original_cross_correlation * 100:.2f}%)")
     
     # 准备训练数据
     print("\n===== 开始训练模型 =====")
@@ -439,11 +511,11 @@ def demo_attention_cca():
     print(f"  视图1 PDS分数: {pds_view1:.4f}")
     print(f"  视图2 PDS分数: {pds_view2:.4f}")
     
-    # 计算MNC分数
-    mnc_view1 = compute_mnc(torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy())
-    mnc_view2 = compute_mnc(torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
-    print(f"  视图1 MNC分数: {mnc_view1:.4f}")
-    print(f"  视图2 MNC分数: {mnc_view2:.4f}")
+    # # 计算MNC分数
+    # mnc_view1 = compute_mnc(torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy())
+    # mnc_view2 = compute_mnc(torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
+    # print(f"  视图1 MNC分数: {mnc_view1:.4f}")
+    # print(f"  视图2 MNC分数: {mnc_view2:.4f}")
     
     # 初始化分类器
     print("\n===== 初始化分类器 =====")
@@ -484,8 +556,8 @@ def demo_attention_cca():
     combined_features = torch.cat([torch.squeeze(trained_view1,dim = 1), torch.squeeze(trained_view2,dim = 1)], dim=1).to(model.device)
     predictions = model.classifier(combined_features)
 
-    classification_loss = F.cross_entropy(predictions, torch.tensor(labels_test, dtype=torch.long).to(model.device))
-    print(f"  分类损失: {classification_loss:.4f}")
+    # classification_loss = F.cross_entropy(predictions, torch.tensor(labels_test, dtype=torch.long).to(model.device))
+    # print(f"  分类损失: {classification_loss:.4f}")
     # 得到预测标签
     predicted_labels = torch.argmax(predictions, dim=1).cpu().numpy()
     # 计算准确率
@@ -500,62 +572,62 @@ def demo_attention_cca():
     print(f"  视图1形状: {trained_view1.shape}")
     print(f"  视图2形状: {trained_view2.shape}")
     
-    # 评估处理前后视图之间的相关性
-    print("\n评估处理前后视图之间的相关性:")
-    print("=========================")
+    # # 评估处理前后视图之间的相关性
+    # print("\n评估处理前后视图之间的相关性:")
+    # print("=========================")
     
-    # 先确保数据是numpy数组
-    if isinstance(view1_test, torch.Tensor):
-        view1_test = view1_test.cpu().numpy()
-    if isinstance(view2_test, torch.Tensor):
-        view2_test = view2_test.cpu().numpy()
-    if isinstance(trained_view1, torch.Tensor):
-        trained_view1 = trained_view1.cpu().numpy()
-    if isinstance(trained_view2, torch.Tensor):
-        trained_view2 = trained_view2.cpu().numpy()
+    # # 先确保数据是numpy数组
+    # if isinstance(view1_test, torch.Tensor):
+    #     view1_test = view1_test.cpu().numpy()
+    # if isinstance(view2_test, torch.Tensor):
+    #     view2_test = view2_test.cpu().numpy()
+    # if isinstance(trained_view1, torch.Tensor):
+    #     trained_view1 = trained_view1.cpu().numpy()
+    # if isinstance(trained_view2, torch.Tensor):
+    #     trained_view2 = trained_view2.cpu().numpy()
     
-    # 评估原始视图间相关性
-    original_cross_correlation_result = evaluate_attention_effect(view1_test, view2_test)
-    original_cross_correlation = original_cross_correlation_result['cross_correlation']
+    # # 评估原始视图间相关性
+    # original_cross_correlation_result = evaluate_attention_effect(view1_test, view2_test)
+    # original_cross_correlation = original_cross_correlation_result['cross_correlation']
     
-    # 评估原始视图的Kmeans聚类效果
-    print("\n原始视图的Kmeans聚类效果:")
-    original_kmeans_result = evaluate_kmeans_clustering(view1_test, view2_test)
-    print(f"  视图1轮廓系数: {original_kmeans_result['view1_silhouette']:.4f}")
-    print(f"  视图2轮廓系数: {original_kmeans_result['view2_silhouette']:.4f}")
-    print(f"  联合轮廓系数: {original_kmeans_result['joint_silhouette']:.4f}")
+    # # 评估原始视图的Kmeans聚类效果
+    # print("\n原始视图的Kmeans聚类效果:")
+    # original_kmeans_result = evaluate_kmeans_clustering(view1_test, view2_test)
+    # print(f"  视图1轮廓系数: {original_kmeans_result['view1_silhouette']:.4f}")
+    # print(f"  视图2轮廓系数: {original_kmeans_result['view2_silhouette']:.4f}")
+    # print(f"  联合轮廓系数: {original_kmeans_result['joint_silhouette']:.4f}")
     
-    # 评估处理后视图间相关性
-    processed_cross_correlation_result = evaluate_attention_effect(trained_view1, trained_view2)
-    processed_cross_correlation = processed_cross_correlation_result['cross_correlation']
+    # # 评估处理后视图间相关性
+    # processed_cross_correlation_result = evaluate_attention_effect(trained_view1, trained_view2)
+    # processed_cross_correlation = processed_cross_correlation_result['cross_correlation']
     
-    # 评估处理后视图的Kmeans聚类效果
-    print("\n处理后视图的Kmeans聚类效果:")
-    processed_kmeans_result = evaluate_kmeans_clustering(trained_view1, trained_view2)
-    print(f"  视图1轮廓系数: {processed_kmeans_result['view1_silhouette']:.4f}")
-    print(f"  视图2轮廓系数: {processed_kmeans_result['view2_silhouette']:.4f}")
-    print(f"  联合轮廓系数: {processed_kmeans_result['joint_silhouette']:.4f}")
+    # # 评估处理后视图的Kmeans聚类效果
+    # print("\n处理后视图的Kmeans聚类效果:")
+    # processed_kmeans_result = evaluate_kmeans_clustering(trained_view1, trained_view2)
+    # print(f"  视图1轮廓系数: {processed_kmeans_result['view1_silhouette']:.4f}")
+    # print(f"  视图2轮廓系数: {processed_kmeans_result['view2_silhouette']:.4f}")
+    # print(f"  联合轮廓系数: {processed_kmeans_result['joint_silhouette']:.4f}")
     
-    print("\n原始视图间相关性:")
-    print(f"  视图1形状: {original_cross_correlation_result['view1_shape']}")
-    print(f"  视图2形状: {original_cross_correlation_result['view2_shape']}")
-    print(f"  视图1均值: {original_cross_correlation_result['view1_mean']:.4f}")
-    print(f"  视图2均值: {original_cross_correlation_result['view2_mean']:.4f}")
-    print(f"  视图1方差: {original_cross_correlation_result['view1_variance']:.4f}")
-    print(f"  视图2方差: {original_cross_correlation_result['view2_variance']:.4f}")
-    print(f"  视图间相关性: {original_cross_correlation:.4f}")
+    # print("\n原始视图间相关性:")
+    # print(f"  视图1形状: {original_cross_correlation_result['view1_shape']}")
+    # print(f"  视图2形状: {original_cross_correlation_result['view2_shape']}")
+    # print(f"  视图1均值: {original_cross_correlation_result['view1_mean']:.4f}")
+    # print(f"  视图2均值: {original_cross_correlation_result['view2_mean']:.4f}")
+    # print(f"  视图1方差: {original_cross_correlation_result['view1_variance']:.4f}")
+    # print(f"  视图2方差: {original_cross_correlation_result['view2_variance']:.4f}")
+    # print(f"  视图间相关性: {original_cross_correlation:.4f}")
     
-    print("\n处理后视图间相关性:")
-    print(f"  视图1形状: {processed_cross_correlation_result['view1_shape']}")
-    print(f"  视图2形状: {processed_cross_correlation_result['view2_shape']}")
-    print(f"  视图1均值: {processed_cross_correlation_result['view1_mean']:.4f}")
-    print(f"  视图2均值: {processed_cross_correlation_result['view2_mean']:.4f}")
-    print(f"  视图1方差: {processed_cross_correlation_result['view1_variance']:.4f}")
-    print(f"  视图2方差: {processed_cross_correlation_result['view2_variance']:.4f}")
-    print(f"  视图间相关性: {processed_cross_correlation:.4f}")
+    # print("\n处理后视图间相关性:")
+    # print(f"  视图1形状: {processed_cross_correlation_result['view1_shape']}")
+    # print(f"  视图2形状: {processed_cross_correlation_result['view2_shape']}")
+    # print(f"  视图1均值: {processed_cross_correlation_result['view1_mean']:.4f}")
+    # print(f"  视图2均值: {processed_cross_correlation_result['view2_mean']:.4f}")
+    # print(f"  视图1方差: {processed_cross_correlation_result['view1_variance']:.4f}")
+    # print(f"  视图2方差: {processed_cross_correlation_result['view2_variance']:.4f}")
+    # print(f"  视图间相关性: {processed_cross_correlation:.4f}")
     
-    print("\n相关性比较:")
-    print(f"  相关性变化: {processed_cross_correlation - original_cross_correlation:.4f} ({(processed_cross_correlation - original_cross_correlation) / original_cross_correlation * 100:.2f}%)")
+    # print("\n相关性比较:")
+    # print(f"  相关性变化: {processed_cross_correlation - original_cross_correlation:.4f} ({(processed_cross_correlation - original_cross_correlation) / original_cross_correlation * 100:.2f}%)")
     
     return trained_view1, trained_view2
 
