@@ -42,7 +42,8 @@ class AttentionCCA:
             'hidden_dim': 128,  # 隐藏层维度
             'use_gpu': False,  # 是否使用GPU
             'enable_cross_attention': True,  # 是否执行交叉注意力环节
-            'num_classes': 40  # 分类类别数，设置为40以匹配1-40的标签范围
+            'num_classes': 40,  # 分类类别数，设置为40以匹配1-40的标签范围
+            'enable_complexity_analysis': True,  # 是否进行复杂度分析
         }
         
         # 更新配置
@@ -145,10 +146,12 @@ class AttentionCCA:
             self.cross_attention1.eval()
             self.cross_attention2.eval()
             with torch.no_grad():
-                # cross_view1 = apply_cross_attention(abs(pds_view1) * processed_view1, abs(pds_view2) * processed_view2, self.cross_attention1, self.device)
-                # cross_view2 = apply_cross_attention(abs(pds_view2) * processed_view2, abs(pds_view1) * processed_view1, self.cross_attention2, self.device)
-                cross_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device)
-                cross_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device)
+                if self.config['enable_complexity_analysis']:
+                    cross_view1 = apply_cross_attention(abs(pds_view1) * processed_view1, abs(pds_view2) * processed_view2, self.cross_attention1, self.device)
+                    cross_view2 = apply_cross_attention(abs(pds_view2) * processed_view2, abs(pds_view1) * processed_view1, self.cross_attention2, self.device)
+                else:
+                    cross_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device)
+                    cross_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device)
             
             # 将结果转换回numpy数组（如果需要）
             if not isinstance(view1_data, torch.Tensor):
@@ -416,8 +419,16 @@ class AttentionCCA:
                     # 应用自注意力和交叉注意力
                     processed_view1 = apply_self_attention(batch_view1, self.view1_attention, self.device, train_mode=True)
                     processed_view2 = apply_self_attention(batch_view2, self.view2_attention, self.device, train_mode=True)
-                    processed_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device, train_mode=True)
-                    processed_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device, train_mode=True)
+
+                    # 计算结构复杂度
+                    pds_view1 = compute_pds(torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy())
+                    pds_view2 = compute_pds(torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
+                    if self.config['enable_complexity_analysis']:
+                        processed_view1 = apply_cross_attention(abs(pds_view1) * batch_view1, abs(pds_view2) * batch_view2, self.cross_attention1, self.device, train_mode=True)
+                        processed_view2 = apply_cross_attention(abs(pds_view2) * batch_view2, abs(pds_view1) * batch_view1, self.cross_attention2, self.device, train_mode=True)
+                    else:
+                        processed_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device, train_mode=True)
+                        processed_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device, train_mode=True)
                 
                 # 计算损失
                 if train_phase == 'self_attention':
@@ -500,10 +511,18 @@ class AttentionCCA:
                             # 应用自注意力
                             processed_view1 = apply_self_attention(tensor_view1, self.view1_attention, self.device)
                             processed_view2 = apply_self_attention(tensor_view2, self.view2_attention, self.device)
+
+                            # 计算结构复杂度
+                            pds_view1 = compute_pds(torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy())
+                            pds_view2 = compute_pds(torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
                             
                             # 应用交叉注意力
-                            cross_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device)
-                            cross_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device)
+                            if self.config['enable_complexity_analysis']:
+                                cross_view1 = apply_cross_attention(abs(pds_view1) * tensor_view1, abs(pds_view2) * tensor_view2, self.cross_attention1, self.device)   
+                                cross_view2 = apply_cross_attention(abs(pds_view2) * tensor_view2, abs(pds_view1) * tensor_view1, self.cross_attention2, self.device)
+                            else:
+                                cross_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device)
+                                cross_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device)
                             
                             # 拼接特征并分类
                             combined_features = torch.cat([cross_view1.mean(dim=1), cross_view2.mean(dim=1)], dim=1).to(self.device)
@@ -567,6 +586,8 @@ def demo_attention_cca():
         'hidden_dim': 128,
         'use_gpu': True,
         'num_classes': 40,  # 40个类别
+        'enable_cross_attention': True,  # 启用交叉注意力
+        'enable_complexity_analysis': False  # 启用结构复杂度分析
     }
     
     # 初始化模型
@@ -612,7 +633,7 @@ def demo_attention_cca():
     # print(f"  视图1 MNC分数: {mnc_view1:.4f}")
     # print(f"  视图2 MNC分数: {mnc_view2:.4f}")
 
-    train_phase='cross_attention'
+    train_phase='self_attention'
     if train_phase =='self_attention':
         # 训练自注意力模型
         print("\n===== 训练自注意力模型和分类器 =====")
@@ -630,7 +651,7 @@ def demo_attention_cca():
         test_data=test_data,
         labels_test=labels_test,
         labels=labels_train,
-        num_epochs=50,  # 训练轮数
+        num_epochs=200,  # 训练轮数
         batch_size=view1_train.shape[0],  # 批次大小
         learning_rate=0.001,  # 学习率
         train_phase = train_phase
