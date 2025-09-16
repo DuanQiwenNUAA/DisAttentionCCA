@@ -325,7 +325,7 @@ class AttentionCCA:
         #     corr = torch.sum(torch.sqrt(U))
         return -corr
         
-    def train_model(self, train_data, test_data, labels_test=None, labels=None, num_epochs=100, batch_size=32, learning_rate=0.01, train_phase='self_attention'):
+    def train_model(self, train_data, test_data, labels_test=None, labels=None, num_epochs=100, batch_size=32, learning_rate=0.001, train_phase='self_attention'):
         """
         训练AttentionCCA模型
         
@@ -367,9 +367,11 @@ class AttentionCCA:
         
         # 根据训练阶段设置优化器参数
         if train_phase == 'self_attention':
-            params = list(self.view1_attention.parameters()) + list(self.view2_attention.parameters())
+            params = list(self.view1_attention.parameters()) + list(self.view2_attention.parameters()) + \
+                     list(self.classifier.parameters())
         elif train_phase == 'cross_attention' and self.config['enable_cross_attention']:
-            params = list(self.cross_attention1.parameters()) + list(self.cross_attention2.parameters()) + \
+            params = list(self.view1_attention.parameters()) + list(self.view2_attention.parameters()) + \
+                     list(self.cross_attention1.parameters()) + list(self.cross_attention2.parameters()) + \
                      list(self.classifier.parameters())
         else:
             raise ValueError("Invalid train_phase or cross attention not enabled")
@@ -383,7 +385,10 @@ class AttentionCCA:
         if train_phase == 'self_attention':
             self.view1_attention.train()
             self.view2_attention.train()
+            self.classifier.train()
         elif train_phase == 'cross_attention' and self.config['enable_cross_attention']:
+            self.view1_attention.train()
+            self.view2_attention.train()
             self.cross_attention1.train()
             self.cross_attention2.train()
             self.classifier.train()
@@ -408,14 +413,15 @@ class AttentionCCA:
                     processed_view1 = apply_self_attention(batch_view1, self.view1_attention, self.device, train_mode=True)
                     processed_view2 = apply_self_attention(batch_view2, self.view2_attention, self.device, train_mode=True)
                 elif train_phase == 'cross_attention':
-                    # 应用交叉注意力
-                    processed_view1 = apply_cross_attention(batch_view1, batch_view2, self.cross_attention1, self.device, train_mode=True)
-                    processed_view2 = apply_cross_attention(batch_view2, batch_view1, self.cross_attention2, self.device, train_mode=True)
+                    # 应用自注意力和交叉注意力
+                    processed_view1 = apply_self_attention(batch_view1, self.view1_attention, self.device, train_mode=True)
+                    processed_view2 = apply_self_attention(batch_view2, self.view2_attention, self.device, train_mode=True)
+                    processed_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device, train_mode=True)
+                    processed_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device, train_mode=True)
                 
                 # 计算损失
                 if train_phase == 'self_attention':
-                    loss = self._correlation_loss(processed_view1, processed_view2)
-                elif train_phase == 'cross_attention' and labels is not None:
+                    # loss = self._correlation_loss(processed_view1, processed_view2)
                     # 拼接两个视图的特征并确保在正确设备上
                     combined_features = torch.cat([processed_view1.mean(dim=1), processed_view2.mean(dim=1)], dim=1).to(self.device)
                     # 确保标签也在相同设备上
@@ -447,12 +453,8 @@ class AttentionCCA:
                             processed_view1 = apply_self_attention(tensor_view1, self.view1_attention, self.device)
                             processed_view2 = apply_self_attention(tensor_view2, self.view2_attention, self.device)
                             
-                            # 应用交叉注意力
-                            cross_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device)
-                            cross_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device)
-                            
                             # 拼接特征并分类
-                            combined_features = torch.cat([cross_view1.mean(dim=1), cross_view2.mean(dim=1)], dim=1)
+                            combined_features = torch.cat([processed_view1.mean(dim=1), processed_view2.mean(dim=1)], dim=1)
                             predictions = self.classifier(combined_features)
                             predicted_labels = torch.argmax(predictions, dim=1)
                             
@@ -460,6 +462,59 @@ class AttentionCCA:
                             if labels_test is not None:
                                 test_labels = torch.tensor(labels_test, dtype=torch.long).to(self.device)
                                 accuracy = torch.mean((predicted_labels == test_labels - 1).float())
+                                print(f"  测试集准确率: {accuracy:.4f}")
+
+
+                elif train_phase == 'cross_attention':
+                    # 拼接两个视图的特征并确保在正确设备上
+                    combined_features = torch.cat([processed_view1.mean(dim=1), processed_view2.mean(dim=1)], dim=1).to(self.device)
+                    # 确保标签也在相同设备上
+                    batch_labels = batch_labels.to(self.device)
+                    # 确保分类器也在相同设备上
+                    self.classifier = self.classifier.to(self.device)
+                    # 计算分类损失
+                    classification_loss = F.cross_entropy(self.classifier(combined_features), batch_labels - 1)  # 将1-40标签转换为0-39范围
+                    # 组合相关性损失和分类损失，使用加权和
+                    # loss = 0.1 * self._correlation_loss(processed_view1, processed_view2) + 0.9 * classification_loss
+                    loss = classification_loss
+
+                    predictions = self.classifier(combined_features)
+                    # 得到预测标签
+                    predicted_labels = torch.argmax(predictions, dim=1)
+                    # 计算准确率
+                    accuracy = torch.mean((predicted_labels == batch_labels - 1).float())
+                    print(f"  训练集准确率: {accuracy:.4f}")
+
+                    # 每10轮评估一次测试集性能
+                    if hasattr(self, 'classifier') and test_data is not None:
+                        view1_test, view2_test = test_data
+                        test_view1 = prepare_for_attention(view1_test)
+                        test_view2 = prepare_for_attention(view2_test)
+                        tensor_view1 = convert_to_tensor(test_view1)
+                        tensor_view2 = convert_to_tensor(test_view2)
+
+                        tensor_view1 = batch_view1
+                        tensor_view2 = batch_view2
+                        
+                        with torch.no_grad():
+                            # 应用自注意力
+                            processed_view1 = apply_self_attention(tensor_view1, self.view1_attention, self.device)
+                            processed_view2 = apply_self_attention(tensor_view2, self.view2_attention, self.device)
+                            
+                            # 应用交叉注意力
+                            cross_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device)
+                            cross_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device)
+                            
+                            # 拼接特征并分类
+                            combined_features = torch.cat([cross_view1.mean(dim=1), cross_view2.mean(dim=1)], dim=1).to(self.device)
+                            # combined_features = torch.cat([processed_view1.mean(dim=1), processed_view2.mean(dim=1)], dim=1).to(self.device)
+                            predictions = self.classifier(combined_features)
+                            predicted_labels = torch.argmax(predictions, dim=1)
+                            
+                            # 计算测试集准确率
+                            if labels_test is not None:
+                                test_labels = torch.tensor(labels, dtype=torch.long).to(self.device)
+                                accuracy = torch.mean((predicted_labels == batch_labels - 1).float())
                                 print(f"  测试集准确率: {accuracy:.4f}")
 
                 else:
@@ -487,34 +542,6 @@ class AttentionCCA:
                 elif train_phase == 'cross_attention':
                     print(f"[交叉注意力] Epoch {epoch+1}/{num_epochs}, Loss: {avg_epoch_loss:.6f}")
                     
-                    # # 每10轮评估一次测试集性能
-                    # if hasattr(self, 'classifier') and test_data is not None:
-                    #     view1_test, view2_test = test_data
-                    #     test_view1 = prepare_for_attention(view1_test)
-                    #     test_view2 = prepare_for_attention(view2_test)
-                    #     tensor_view1 = convert_to_tensor(test_view1)
-                    #     tensor_view2 = convert_to_tensor(test_view2)
-                        
-                    #     with torch.no_grad():
-                    #         processed_view1 = apply_self_attention(tensor_view1, self.view1_attention, self.device)
-                    #         processed_view2 = apply_self_attention(tensor_view2, self.view2_attention, self.device)
-                            
-                    #         # 应用交叉注意力
-                    #         cross_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device)
-                    #         cross_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device)
-                            
-                    #         # 拼接特征并分类
-                    #         combined_features = torch.cat([cross_view1.mean(dim=1), cross_view2.mean(dim=1)], dim=1)
-                    #         predictions = self.classifier(combined_features)
-                    #         predicted_labels = torch.argmax(predictions, dim=1)
-                            
-                    #         # 计算测试集准确率
-                    #         if labels_test is not None:
-                    #             test_labels = torch.tensor(labels_test, dtype=torch.long).to(self.device)
-                    #             accuracy = torch.mean((predicted_labels == test_labels - 1).float())
-                    #             print(f"  测试集准确率: {accuracy:.4f}")
-                    
-        
         return loss_history, processed_view1, processed_view2
 
 # 示例用法函数
@@ -545,15 +572,11 @@ def demo_attention_cca():
     # 初始化模型
     model = AttentionCCA(config)
     
-    # 使用未训练的模型处理数据
-    print("===== 未训练模型的处理结果 =====")
-    untrained_view1, untrained_view2 = model.process_views(view1_data, view2_data)
-    print(f"\n测试数据形状:")
-    print(f"  视图1形状: {view1_data.shape}")
-    print(f"  视图2形状: {view2_data.shape}")
-    print(f"训练后处理结果形状:")
-    print(f"  视图1形状: {untrained_view1.squeeze().shape}")
-    print(f"  视图2形状: {untrained_view2.squeeze().shape}")
+    # 初始化分类器
+    print("\n===== 初始化分类器 =====")
+    combined_dim = (model.config['view1_output_dim'] or model.config['view1_input_dim']) + \
+                      (model.config['view2_output_dim'] or model.config['view2_input_dim'])
+    model.classifier = nn.Linear(combined_dim, model.config.get('num_classes', 40))
 
     # 准备训练数据
     print("\n===== 开始训练模型 =====")
@@ -562,9 +585,47 @@ def demo_attention_cca():
     train_data = (view1_train, view2_train)
     test_data = (view1_test, view2_test)
     
-    # 训练自注意力模型
-    print("===== 训练自注意力模型 =====")
-    self_loss_history, processed_view1, processed_view2 = model.train_model(
+    # # 训练自注意力模型
+    # print("===== 训练自注意力模型和分类器 =====")
+    # self_loss_history, processed_view1, processed_view2 = model.train_model(
+    #     train_data=train_data,
+    #     test_data=test_data,
+    #     labels_test=labels_test,
+    #     labels=labels_train,
+    #     num_epochs=50,  # 训练轮数
+    #     batch_size=view1_train.shape[0],  # 批次大小
+    #     learning_rate=0.001,  # 学习率
+    #     train_phase='self_attention'
+    # )
+
+    # # 计算自注意力模型输出数据的结构复杂度
+    # print("\n===== 计算自注意力模型输出数据的结构复杂度 =====")
+    # #计算PDS分数
+    # pds_view1 = compute_pds(torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy())
+    # pds_view2 = compute_pds(torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
+    # print(f"  视图1 PDS分数: {pds_view1:.4f}")
+    # print(f"  视图2 PDS分数: {pds_view2:.4f}")
+    
+    # # 计算MNC分数
+    # mnc_view1 = compute_mnc(torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy())
+    # mnc_view2 = compute_mnc(torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
+    # print(f"  视图1 MNC分数: {mnc_view1:.4f}")
+    # print(f"  视图2 MNC分数: {mnc_view2:.4f}")
+
+    train_phase='cross_attention'
+    if train_phase =='self_attention':
+        # 训练自注意力模型
+        print("\n===== 训练自注意力模型和分类器 =====")
+        model.config['enable_cross_attention'] = False
+    elif train_phase == 'cross_attention':
+        # 训练自注意力和交叉注意力模型
+        print("\n===== 训练自注意力和交叉注意力模型、分类器 =====")
+        model.config['enable_cross_attention'] = True
+
+    # 使用自注意力模型的输出，使用加权后的输出作为交叉注意力的输入
+    # train_data = (abs(pds_view1) * torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy(), abs(pds_view2) * torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
+    # train_data = (torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy(), torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
+    cross_loss_history, processed_view1, processed_view2 = model.train_model(
         train_data=train_data,
         test_data=test_data,
         labels_test=labels_test,
@@ -572,45 +633,7 @@ def demo_attention_cca():
         num_epochs=50,  # 训练轮数
         batch_size=view1_train.shape[0],  # 批次大小
         learning_rate=0.001,  # 学习率
-        train_phase='self_attention'
-    )
-
-    # 计算自注意力模型输出数据的结构复杂度
-    print("\n===== 计算自注意力模型输出数据的结构复杂度 =====")
-    #计算PDS分数
-    pds_view1 = compute_pds(torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy())
-    pds_view2 = compute_pds(torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
-    print(f"  视图1 PDS分数: {pds_view1:.4f}")
-    print(f"  视图2 PDS分数: {pds_view2:.4f}")
-    
-    # # 计算MNC分数
-    # mnc_view1 = compute_mnc(torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy())
-    # mnc_view2 = compute_mnc(torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
-    # print(f"  视图1 MNC分数: {mnc_view1:.4f}")
-    # print(f"  视图2 MNC分数: {mnc_view2:.4f}")
-    
-    # 初始化分类器
-    print("\n===== 初始化分类器 =====")
-    combined_dim = (model.config['view1_output_dim'] or model.config['view1_input_dim']) + \
-                      (model.config['view2_output_dim'] or model.config['view2_input_dim'])
-    model.classifier = nn.Linear(combined_dim, model.config.get('num_classes', 40))
-
-    # 训练交叉注意力模型
-    print("\n===== 训练交叉注意力模型和分类器 =====")
-    model.config['enable_cross_attention'] = True
-    
-    # 使用自注意力模型的输出，使用加权后的输出作为交叉注意力的输入
-    train_data = (abs(pds_view1) * torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy(), abs(pds_view2) * torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
-    train_data = (torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy(), torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
-    cross_loss_history, processed_view1, processed_view2 = model.train_model(
-        train_data=train_data,
-        test_data=test_data,
-        labels_test=labels_test,
-        labels=labels_train,
-        num_epochs=500,  # 训练轮数
-        batch_size=view1_train.shape[0],  # 批次大小
-        learning_rate=0.001,  # 学习率
-        train_phase='cross_attention'
+        train_phase = train_phase
     )
 
     # 保存所有模型
@@ -635,7 +658,7 @@ def demo_attention_cca():
     print(f"  视图1形状: {trained_view1.squeeze().shape}")
     print(f"  视图2形状: {trained_view2.squeeze().shape}")
 
-    # 使用训练后的模型，得到测试集的输出结果，进而可以使用训练好的全连接分类器，得到测试集的预测标签
+    # 使用训练后模型，得到测试集的输出结果，进而可以使用训练好的全连接分类器，得到测试集的预测标签
     print("\n===== 测试集的预测标签 =====")
     # 先拼接，再分类
     if not isinstance(trained_view1, torch.Tensor):
