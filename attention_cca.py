@@ -512,14 +512,14 @@ class AttentionCCA:
                             processed_view1 = apply_self_attention(tensor_view1, self.view1_attention, self.device)
                             processed_view2 = apply_self_attention(tensor_view2, self.view2_attention, self.device)
 
-                            # 计算结构复杂度
+                            # 计算结构复杂度，更小的PDS分数，表示更高的结构复杂度，PDS一般为负数，使用绝对值，绝对值越大，结构复杂度越高
                             pds_view1 = compute_pds(torch.squeeze(processed_view1,dim = 1).detach().cpu().numpy())
                             pds_view2 = compute_pds(torch.squeeze(processed_view2,dim = 1).detach().cpu().numpy())
                             
                             # 应用交叉注意力
-                            if self.config['enable_complexity_analysis']:
-                                cross_view1 = apply_cross_attention(abs(pds_view1) * tensor_view1, abs(pds_view2) * tensor_view2, self.cross_attention1, self.device)   
-                                cross_view2 = apply_cross_attention(abs(pds_view2) * tensor_view2, abs(pds_view1) * tensor_view1, self.cross_attention2, self.device)
+                            if self.config['enable_complexity_analysis']: # 使用绝对值的倒数作为权重
+                                cross_view1 = apply_cross_attention(1.0 / abs(pds_view1) * tensor_view1, 1.0 / abs(pds_view2) * tensor_view2, self.cross_attention1, self.device)   
+                                cross_view2 = apply_cross_attention(1.0 / abs(pds_view2) * tensor_view2, 1.0 / abs(pds_view1) * tensor_view1, self.cross_attention2, self.device)
                             else:
                                 cross_view1 = apply_cross_attention(processed_view1, processed_view2, self.cross_attention1, self.device)
                                 cross_view2 = apply_cross_attention(processed_view2, processed_view1, self.cross_attention2, self.device)
@@ -587,7 +587,7 @@ def demo_attention_cca():
         'use_gpu': True,
         'num_classes': 40,  # 40个类别
         'enable_cross_attention': True,  # 启用交叉注意力
-        'enable_complexity_analysis': False  # 启用结构复杂度分析
+        'enable_complexity_analysis': True  # 启用结构复杂度分析
     }
     
     # 初始化模型
